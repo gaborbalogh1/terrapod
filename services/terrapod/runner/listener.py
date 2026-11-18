@@ -7,10 +7,11 @@ The listener:
 2. Starts heartbeat loop (every 60s)
 3. Connects to the API via SSE for event-driven work
 4. Runs a polling fallback loop (every 30s) alongside SSE
-5. On run_available: claims run, launches K8s Job, reports Job name — DONE
-6. On check_job_status: queries K8s, POSTs result back
-7. On stream_logs: reads pod logs, PUTs log bytes back
-8. On cancel_job: deletes K8s Job
+5. On run_available: claims run, launches a K8s Job (or an ECS Task when
+   opted in), reports the execution identifier — DONE
+6. On check_job_status: queries the execution backend, POSTs result back
+7. On stream_logs: reads runner logs, PUTs log bytes back
+8. On cancel_job: stops the K8s Job or ECS Task
 9. Serves /health and /ready HTTP endpoints for K8s probes
 
 SSE provides sub-second responsiveness for run claiming. The polling
@@ -85,6 +86,11 @@ class RunnerListener:
         # os.environ. Only secrets (join token) + runtime values (POD_NAME)
         # remain as Deployment env (read at their point of use).
         self.runner_config = load_runner_config()
+        # Execution backend is a listener concern only. Kubernetes stays the
+        # default; the ECS client is created on first use so a Kubernetes
+        # deployment never imports or configures any AWS SDK code.
+        self._execution_backend = self.runner_config.execution.backend
+        self._ecs_backend = None
         self._heartbeat_interval = self.runner_config.heartbeat_interval
         self._max_concurrent = self.runner_config.max_concurrent
         self._health_port = self.runner_config.health_port
@@ -297,6 +303,9 @@ class RunnerListener:
         finally:
             await self._http_client.aclose()
             await self._sse_client.aclose()
+            if self._ecs_backend is not None:
+                await self._ecs_backend.close()
+                self._ecs_backend = None
 
     async def _cert_renewal_loop(self) -> None:
         """Keep the listener's X.509 cert fresh.
@@ -922,10 +931,9 @@ class RunnerListener:
         (#749), so a slot freed mid-drain is used and a cluster that is already
         full is never over-admitted onto.
         """
-        from terrapod.runner.job_manager import list_occupying_runner_jobs
         from terrapod.runner.job_template import runner_job_name
 
-        # Jobs this pass created. The list below is a consistent read (see
+        # Execution identifiers this pass created. The list below is a consistent read (see
         # list_occupying_runner_jobs), so a Job is normally already in it; the
         # union keeps THIS pass exact if that is ever weakened, and a union
         # cannot double-count the way adding an integer would.
@@ -938,19 +946,35 @@ class RunnerListener:
                 return False
 
             # Capacity-aware admission (#749): gate on the real set of
-            # occupying Jobs from K8s (authoritative — keeps the listener
+            # occupying executions (authoritative — keeps the listener
             # stateless), plus the in-flight claim→create window, plus what
             # this pass has already created.
-            occupying = await list_occupying_runner_jobs(self.runner_config.runner_namespace)
+            try:
+                if self._execution_backend == "ecs":
+                    occupying = await (await self._get_ecs_backend()).list_running()
+                else:
+                    from terrapod.runner.job_manager import list_occupying_runner_jobs
+
+                    occupying = await list_occupying_runner_jobs(
+                        self.runner_config.runner_namespace
+                    )
+            except Exception as e:
+                occupying = None
+                logger.warning(
+                    "Occupancy lookup failed",
+                    backend=self._execution_backend,
+                    error=str(e),
+                )
             if occupying is None:
-                # Fail CLOSED: K8s (the source of truth for occupancy) was
+                # Fail CLOSED: the source of truth for occupancy was
                 # unreachable after retries. Defer this drain pass rather than
                 # launch blind — the runs stay queued and the next
                 # `run_available`/poll re-drives them. This is what stops a
-                # transient apiserver blip from snowballing into an over-launch
-                # storm (see list_occupying_runner_jobs).
+                # transient apiserver/ECS blip from snowballing into an
+                # over-launch storm.
                 logger.warning(
-                    "Deferring run claim — occupancy unknown from K8s (fail-closed)",
+                    "Deferring run claim — occupancy unknown (fail-closed)",
+                    backend=self._execution_backend,
                     active_launches=self._active_launches,
                     launched=len(launched_names),
                 )
@@ -983,22 +1007,35 @@ class RunnerListener:
             attrs = data.get("attributes", {})
 
             # Reserve the slot BEFORE launching, and keep it reserved even if
-            # the launch fails: a launch that fails *after* creating the Job
-            # leaves the Job occupying a node, and one that fails before it
-            # costs this pass a single slot that the next list corrects.
+            # the launch fails: a launch that fails *after* creating the
+            # execution leaves it occupying capacity, and one that fails before
+            # it costs this pass a single slot that the next list corrects.
             # Over-admitting is the expensive direction.
-            launched_names.add(runner_job_name(run_id, attrs.get("phase", "plan")))
+            phase = attrs.get("phase", "plan")
+            slot = (
+                f"ecs-pending-{run_id}-{phase}"
+                if self._execution_backend == "ecs"
+                else runner_job_name(run_id, phase)
+            )
+            launched_names.add(slot)
 
             self._active_launches += 1
             try:
-                await self._launch_run(run_id, attrs)
+                identifier = await self._launch_run(run_id, attrs)
             finally:
                 self._active_launches -= 1
+            if identifier:
+                launched_names.discard(slot)
+                launched_names.add(identifier)
 
-    async def _launch_run(self, run_id: str, attrs: dict) -> None:
-        """Build and launch a K8s Job for a claimed run, then report back.
+    async def _launch_run(self, run_id: str, attrs: dict) -> str:
+        """Build and launch one execution for a claimed run, then report back.
 
-        Any pre-Job failure (token request, Job create, auth Secret create)
+        The Kubernetes path is unchanged. Under the opt-in ECS backend the same
+        Job spec is translated into a RunTask request and the returned task ARN
+        takes the place of the Job name in the listener→API contract.
+
+        Any pre-execution failure (token request, create, auth Secret create)
         must transition the run to `errored` via the API — otherwise the run
         sits forever in `planning`/`applying` because the reconciler skips
         runs without a `job_name`. The reconciler's `launch_timeout` is the
@@ -1009,6 +1046,16 @@ class RunnerListener:
         from terrapod.runner.job_manager import create_job, get_job_uid
 
         phase = attrs.get("phase", "plan")
+
+        # The ECS path deliberately supports only the runner container. An
+        # Ansible execution environment needs the Kubernetes sidecar, shared
+        # volume and projected EE token; silently dropping them would run a
+        # playbook with missing credentials. Fail the run instead.
+        if self._execution_backend == "ecs" and attrs.get("ee-image", ""):
+            await self._report_launch_failed(
+                run_id, "Ansible execution environments are not supported by the ECS backend"
+            )
+            return ""
 
         # The Job spec is built through the engine strategy rather than by calling
         # the template directly (#1407 phase 1). Terraform is the only engine, and
@@ -1039,7 +1086,7 @@ class RunnerListener:
         except Exception as e:
             logger.error("Failed to fetch runner token", run_id=run_id, error=str(e))
             await self._report_launch_failed(run_id, f"Could not obtain runner token: {e}")
-            return
+            return ""
 
         env_vars = [{"key": v["key"], "value": v["value"]} for v in attrs.get("env-vars", [])]
         native_vars = [
@@ -1108,7 +1155,7 @@ class RunnerListener:
         except ValueError as e:
             logger.error("Refusing vault files", run_id=run_id, reason=str(e))
             await self._report_launch_failed(run_id, f"OpenBao/Vault file delivery refused: {e}")
-            return
+            return ""
 
         # The SAME slug the Job gets, from the one producer: these Secrets
         # carry the run's credentials and variables, so a slug that disagreed
@@ -1218,7 +1265,31 @@ class RunnerListener:
                 exc_info=True,
             )
             await self._report_launch_failed(run_id, f"Failed to build {phase} Job spec: {e}")
-            return
+            return ""
+
+        if self._execution_backend == "ecs":
+            try:
+                secret_data = self._ecs_secret_data(
+                    runner_token=runner_token,
+                    terraform_vars=native_vars,
+                    env_vars=env_vars,
+                    execution_hooks=execution_hooks,
+                    git_auth=git_auth,
+                    ansible_auth=ansible_auth,
+                    vault_file_values=vault_file_values,
+                    ca_pem=ca_pem,
+                )
+            except Exception as e:
+                logger.error("Failed to build ECS run payload", run_id=run_id, error=str(e))
+                await self._report_launch_failed(run_id, f"Failed to build ECS run payload: {e}")
+                return ""
+            return await self._launch_ecs_run(
+                run_id=run_id,
+                phase=phase,
+                spec=spec,
+                secret_data=secret_data,
+                vault_mounts=vault_file_mounts,
+            )
 
         namespace = self.runner_config.runner_namespace
 
@@ -1227,7 +1298,7 @@ class RunnerListener:
         except Exception as e:
             logger.error("Failed to create Job", run_id=run_id, error=str(e))
             await self._report_launch_failed(run_id, f"Failed to create K8s Job: {e}")
-            return
+            return ""
 
         # Create auth Secret with ownerReference to the Job. Pass the namespace
         # explicitly (from runner_config) — never rely on job_manager's fallback,
@@ -1251,7 +1322,7 @@ class RunnerListener:
         except Exception as e:
             logger.error("Failed to create auth secret", run_id=run_id, error=str(e))
             await self._report_launch_failed(run_id, f"Failed to create runner auth Secret: {e}")
-            return
+            return ""
 
         # Create the vars Secret (same ownerReference GC as the auth Secret).
         if vars_secret_name:
@@ -1271,7 +1342,7 @@ class RunnerListener:
             except Exception as e:
                 logger.error("Failed to create vars secret", run_id=run_id, error=str(e))
                 await self._report_launch_failed(run_id, f"Failed to create variables Secret: {e}")
-                return
+                return ""
 
         # Create the per-run CA Secret (#592) — same ownerReference GC as the
         # auth/vars Secrets. Holds the custom outbound CA the runner's init
@@ -1282,33 +1353,16 @@ class RunnerListener:
             except Exception as e:
                 logger.error("Failed to create CA secret", run_id=run_id, error=str(e))
                 await self._report_launch_failed(run_id, f"Failed to create CA Secret: {e}")
-                return
+                return ""
 
-        # Report Job launched to the API
-        try:
-            await arequest_with_retry(
-                self._http_client,
-                "POST",
-                f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}"
-                f"/runs/run-{run_id}/job-launched",
-                idempotent=True,  # idempotent upsert of the run's job_name — safe to retry
-                json={"job_name": job_name, "job_namespace": namespace},
-                headers_factory=self._sign_headers,
-            )
-        except Exception as e:
-            logger.error("Failed to report job-launched", run_id=run_id, error=str(e))
-            # Don't error the run here — the Job is genuinely running. The
-            # reconciler will time it out via stale_timeout if status reports
-            # never arrive, but a transient HTTP blip here shouldn't kill an
-            # otherwise-healthy plan/apply.
-            return
-
+        await self._report_job_launched(run_id, job_name, namespace)
         logger.info(
             "Job launched",
             run_id=run_id,
             phase=phase,
             job=job_name,
         )
+        return job_name
 
     @staticmethod
     def _plan_vault_files(raw: list, env_vars: list[dict]) -> tuple[list[dict], dict[str, str]]:
@@ -1350,6 +1404,178 @@ class RunnerListener:
             raise ValueError(str(e)) from e
         return mounts, values
 
+    # ── ECS execution backend ──────────────────────────────────────────
+
+    async def _get_ecs_backend(self):
+        """Create the ECS client on first use, never on the Kubernetes path."""
+        if self._ecs_backend is None:
+            from terrapod.runner.ecs_backend import EcsExecutionBackend
+
+            self._ecs_backend = EcsExecutionBackend(self.runner_config.execution.ecs)
+        return self._ecs_backend
+
+    @staticmethod
+    def _vars_secret_data(
+        terraform_vars: list[dict],
+        env_vars: list[dict],
+        execution_hooks: list[dict] | None,
+        git_auth: list[dict] | None,
+        ansible_auth: list[dict] | None,
+        vault_file_values: dict[str, str] | None,
+    ) -> dict[str, str]:
+        """Build the exact key/value set the per-run vars Secret would carry.
+
+        Both execution backends must hand the runner the same data. Building it
+        once here stops ECS from gaining a subtly different tfvars/hooks/auth
+        payload when a new channel is added to the vars Secret later.
+        """
+        data: dict[str, str] = {}
+        if terraform_vars:
+            data["terraform.tfvars.json"] = json.dumps(
+                [
+                    {
+                        "key": v["key"],
+                        "value": v["value"],
+                        "structured": bool(v.get("structured", v.get("hcl"))),
+                        "hcl": bool(v.get("structured", v.get("hcl"))),
+                        "sensitive": bool(v.get("sensitive")),
+                    }
+                    for v in terraform_vars
+                ]
+            )
+        if execution_hooks:
+            data["execution-hooks.json"] = json.dumps(
+                [
+                    {
+                        "hook_point": h.get("hook_point", ""),
+                        "name": h.get("name", ""),
+                        "script": h.get("script", ""),
+                    }
+                    for h in execution_hooks
+                ]
+            )
+        if git_auth:
+            data["git-auth.json"] = json.dumps(
+                [
+                    {
+                        "category": g.get("category", ""),
+                        "key": g.get("key", ""),
+                        "value": g.get("value", ""),
+                    }
+                    for g in git_auth
+                ]
+            )
+        if ansible_auth:
+            data["ansible-auth.json"] = json.dumps(
+                [
+                    {
+                        "category": a.get("category", ""),
+                        "key": a.get("key", ""),
+                        "value": a.get("value", ""),
+                    }
+                    for a in ansible_auth
+                ]
+            )
+        for var in env_vars:
+            data[var["key"]] = var["value"]
+        # _plan_vault_files already refused a clash with an env key.
+        for secret_key, content in (vault_file_values or {}).items():
+            data[secret_key] = content
+        return data
+
+    @classmethod
+    def _ecs_secret_data(
+        cls,
+        *,
+        runner_token: str,
+        terraform_vars: list[dict],
+        env_vars: list[dict],
+        execution_hooks: list[dict] | None,
+        git_auth: list[dict] | None,
+        ansible_auth: list[dict] | None,
+        vault_file_values: dict[str, str] | None,
+        ca_pem: str,
+    ) -> dict[str, str]:
+        """Flatten the per-run Secrets into the ECS entrypoint's payload.
+
+        The auth token and the vars/CA Secrets are three Kubernetes objects but
+        one set of container overrides under ECS, so reserved keys that lived in
+        different Secrets must be checked here before they overwrite each other.
+        """
+        data = cls._vars_secret_data(
+            terraform_vars,
+            env_vars,
+            execution_hooks,
+            git_auth,
+            ansible_auth,
+            vault_file_values,
+        )
+        reserved = {"token", "ca-extra.pem"}
+        clashes = sorted(reserved.intersection(data))
+        if clashes:
+            raise ValueError(f"reserved ECS payload key(s) used by run variables: {', '.join(clashes)}")
+        data["token"] = runner_token
+        if ca_pem:
+            data["ca-extra.pem"] = ca_pem
+        return data
+
+    async def _launch_ecs_run(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        spec: dict,
+        secret_data: dict[str, str],
+        vault_mounts: list[dict],
+    ) -> str:
+        """Start one ECS Task, report its ARN as the job_name, and return it."""
+        from terrapod.runner.ecs_task import run_task_kwargs
+
+        try:
+            kwargs = run_task_kwargs(
+                spec=spec,
+                config=self.runner_config.execution.ecs,
+                secret_data=secret_data,
+                vault_mounts=vault_mounts,
+                run_id=run_id,
+                phase=phase,
+            )
+        except ValueError as e:
+            logger.error("Failed to build ECS RunTask request", run_id=run_id, error=str(e))
+            await self._report_launch_failed(run_id, f"Failed to build ECS run request: {e}")
+            return ""
+
+        try:
+            task_arn = await (await self._get_ecs_backend()).run_task(kwargs)
+        except Exception as e:
+            logger.error("Failed to start ECS task", run_id=run_id, error=str(e))
+            await self._report_launch_failed(run_id, f"Failed to start ECS task: {e}")
+            return ""
+
+        # The API treats job_namespace as opaque for ECS; recording the cluster
+        # here keeps status/log/cancel requests routable and is useful in the UI.
+        await self._report_job_launched(run_id, task_arn, self.runner_config.execution.ecs.cluster)
+        logger.info("ECS task launched", run_id=run_id, phase=phase, task=task_arn)
+        return task_arn
+
+    async def _report_job_launched(self, run_id: str, job_name: str, job_namespace: str) -> None:
+        """Report the execution identifier to the API with bounded retry."""
+        try:
+            await arequest_with_retry(
+                self._http_client,
+                "POST",
+                f"/api/terrapod/v1/listeners/listener-{self.identity.listener_id}"
+                f"/runs/run-{run_id}/job-launched",
+                idempotent=True,  # idempotent upsert of job_name — safe to retry
+                json={"job_name": job_name, "job_namespace": job_namespace},
+                headers_factory=self._sign_headers,
+            )
+        except Exception as e:
+            logger.error("Failed to report job-launched", run_id=run_id, error=str(e))
+            # Don't error the run here — the execution is genuinely running. The
+            # reconciler will time it out via stale_timeout if status reports
+            # never arrive, but a transient HTTP blip shouldn't kill a healthy run.
+
     async def _report_launch_failed(self, run_id: str, error_message: str) -> None:
         """Mark a run errored when the listener can't launch its Job.
 
@@ -1381,13 +1607,7 @@ class RunnerListener:
             )
 
     async def _handle_check_job_status(self, data: dict) -> None:
-        """Query K8s for Job status and POST the result back to the API."""
-        from terrapod.runner.job_manager import (
-            get_job_failure_info,
-            get_job_status,
-            get_pod_terminated_info,
-        )
-
+        """Query the selected execution backend and POST the result back."""
         job_name = data.get("job_name", "")
         job_namespace = data.get("job_namespace", "")
         run_id = data.get("run_id", "")
@@ -1396,64 +1616,87 @@ class RunnerListener:
         if not job_name or not run_id:
             return
 
-        try:
-            status = await get_job_status(job_name, namespace=job_namespace)
-            if status is None:
-                status = "deleted"
-        except Exception as e:
-            logger.warning("Failed to get Job status", job=job_name, error=str(e))
-            return
-
-        # For Failed Jobs, also collect the container terminated info — exit
-        # code + K8s termination reason (OOMKilled / Error / Completed).
-        # The API maps `reason` to the typed runner_exit_status bucket (#430).
-        #
-        # Two-tier lookup:
-        #   1. Pod-side: list the Job's pods and read the runner container's
-        #      terminated state. This is the authoritative source — both
-        #      exit_code AND reason (which carries "OOMKilled" when relevant).
-        #   2. Job-side fallback: when the pod has been GC'd before we
-        #      observed it (taint-eviction, TTL controller, manual cleanup),
-        #      the Job itself carries the failure cause in
-        #      status.conditions[?].reason="PodFailurePolicy". Parse the
-        #      exit code out so we can still typify the run as `killed`
-        #      or `error` instead of an empty status. Reason stays empty
-        #      because the Job-controller event doesn't carry the K8s
-        #      container terminated.reason — the API's typed-bucket
-        #      mapping handles `reason=""` + `exit_code=137` correctly.
-        body: dict = {"status": status, "phase": phase}
-        # `terminal` (#1649): whether the Job itself has finished — its
-        # Complete or Failed condition — as opposed to having had a pod fail
-        # that Kubernetes is about to retry. The API waits for it before
-        # revoking a phase's Vault leases. Omitted when it cannot be read, and
-        # the API then falls back to the status alone.
-        if status == "deleted":
-            body["terminal"] = True
-        elif status in ("succeeded", "failed"):
-            from terrapod.runner.job_manager import job_is_finished
+        if self._execution_backend == "ecs":
+            try:
+                result = await (await self._get_ecs_backend()).task_status(job_name)
+            except Exception as e:
+                logger.warning("Failed to get ECS task status", task=job_name, error=str(e))
+                return
+            body: dict = {
+                "status": result["status"],
+                "terminal": bool(result.get("terminal")),
+                "phase": phase,
+            }
+            # The API uses these to typify a failed run and to show a useful
+            # reason in the UI; ECS supplies them from the stopped container.
+            for key in ("exit_code", "reason"):
+                if key in result:
+                    body[key] = result[key]
+        else:
+            from terrapod.runner.job_manager import (
+                get_job_failure_info,
+                get_job_status,
+                get_pod_terminated_info,
+            )
 
             try:
-                finished = await job_is_finished(job_name, namespace=job_namespace)
+                status = await get_job_status(job_name, namespace=job_namespace)
+                if status is None:
+                    status = "deleted"
             except Exception as e:
-                finished = None
-                logger.debug("Failed to read Job conditions", job=job_name, error=str(e))
-            if finished is not None:
-                body["terminal"] = finished
-        if status == "failed":
-            try:
-                info = await get_pod_terminated_info(job_name, namespace=job_namespace)
-                if info is None:
-                    info = await get_job_failure_info(job_name, namespace=job_namespace)
-                if info is not None:
-                    body["exit_code"] = info["exit_code"]
-                    body["reason"] = info["reason"]
-            except Exception as e:
-                logger.debug(
-                    "Failed to get pod/job terminated info",
-                    job=job_name,
-                    run_id=run_id,
-                    error=str(e),
-                )
+                logger.warning("Failed to get Job status", job=job_name, error=str(e))
+                return
+
+            # For Failed Jobs, also collect the container terminated info — exit
+            # code + K8s termination reason (OOMKilled / Error / Completed).
+            # The API maps `reason` to the typed runner_exit_status bucket (#430).
+            #
+            # Two-tier lookup:
+            #   1. Pod-side: list the Job's pods and read the runner container's
+            #      terminated state. This is the authoritative source — both
+            #      exit_code AND reason (which carries "OOMKilled" when relevant).
+            #   2. Job-side fallback: when the pod has been GC'd before we
+            #      observed it (taint-eviction, TTL controller, manual cleanup),
+            #      the Job itself carries the failure cause in
+            #      status.conditions[?].reason="PodFailurePolicy". Parse the
+            #      exit code out so we can still typify the run as `killed`
+            #      or `error` instead of an empty status. Reason stays empty
+            #      because the Job-controller event doesn't carry the K8s
+            #      container terminated.reason — the API's typed-bucket
+            #      mapping handles `reason=""` + `exit_code=137` correctly.
+            body = {"status": status, "phase": phase}
+            # `terminal` (#1649): whether the Job itself has finished — its
+            # Complete or Failed condition — as opposed to having had a pod fail
+            # that Kubernetes is about to retry. The API waits for it before
+            # revoking a phase's Vault leases. Omitted when it cannot be read,
+            # and the API then falls back to the status alone.
+            if status == "deleted":
+                body["terminal"] = True
+            elif status in ("succeeded", "failed"):
+                from terrapod.runner.job_manager import job_is_finished
+
+                try:
+                    finished = await job_is_finished(job_name, namespace=job_namespace)
+                except Exception as e:
+                    finished = None
+                    logger.debug("Failed to read Job conditions", job=job_name, error=str(e))
+                if finished is not None:
+                    body["terminal"] = finished
+            if status == "failed":
+                try:
+                    info = await get_pod_terminated_info(job_name, namespace=job_namespace)
+                    if info is None:
+                        info = await get_job_failure_info(job_name, namespace=job_namespace)
+                    if info is not None:
+                        body["exit_code"] = info["exit_code"]
+                        body["reason"] = info["reason"]
+                except Exception as e:
+                    logger.debug(
+                        "Failed to get pod/job terminated info",
+                        job=job_name,
+                        run_id=run_id,
+                        error=str(e),
+                    )
 
         try:
             await arequest_with_retry(
@@ -1469,9 +1712,7 @@ class RunnerListener:
             logger.warning("Failed to report Job status", run_id=run_id, error=str(e))
 
     async def _handle_stream_logs(self, data: dict) -> None:
-        """Read pod logs from K8s and PUT them back to the API."""
-        from terrapod.runner.job_manager import get_pod_logs
-
+        """Read runner logs from the selected backend and PUT them to the API."""
         job_name = data.get("job_name", "")
         job_namespace = data.get("job_namespace", "")
         run_id = data.get("run_id", "")
@@ -1481,28 +1722,42 @@ class RunnerListener:
         if not job_name or not run_id:
             return
 
-        try:
-            logs = await get_pod_logs(
-                job_name,
-                namespace=job_namespace,
-                tail_lines=tail_lines,
-                limit_bytes=256 * 1024,  # Cap at 256KB to bound memory per call
-            )
-            if not logs:
+        if self._execution_backend == "ecs":
+            try:
+                logs = await (await self._get_ecs_backend()).logs(job_name, tail_lines)
+            except Exception as e:
+                logger.debug(
+                    "Failed to read ECS task logs (may be starting up)",
+                    run_id=run_id,
+                    task=job_name,
+                    error=str(e),
+                )
                 return
-        except Exception as e:
-            # Pod may not have logs yet (container still starting) — this is
-            # expected for the first few events after Job launch. But we MUST
-            # log so that repeated failures are diagnosable; previously this
-            # was a bare `except: return` which silenced permanent failures
-            # (auth, RBAC, wrong namespace, etc.) indistinguishably from the
-            # benign "logs not ready" case.
-            logger.debug(
-                "Failed to read pod logs (may be starting up)",
-                run_id=run_id,
-                job=job_name,
-                error=str(e),
-            )
+        else:
+            from terrapod.runner.job_manager import get_pod_logs
+
+            try:
+                logs = await get_pod_logs(
+                    job_name,
+                    namespace=job_namespace,
+                    tail_lines=tail_lines,
+                    limit_bytes=256 * 1024,  # Cap at 256KB to bound memory per call
+                )
+            except Exception as e:
+                # Pod may not have logs yet (container still starting) — this is
+                # expected for the first few events after Job launch. But we MUST
+                # log so that repeated failures are diagnosable; previously this
+                # was a bare `except: return` which silenced permanent failures
+                # (auth, RBAC, wrong namespace, etc.) indistinguishably from the
+                # benign "logs not ready" case.
+                logger.debug(
+                    "Failed to read pod logs (may be starting up)",
+                    run_id=run_id,
+                    job=job_name,
+                    error=str(e),
+                )
+                return
+        if not logs:
             return
 
         # Encode once — avoid holding both str and bytes simultaneously
@@ -1535,14 +1790,22 @@ class RunnerListener:
             )
 
     async def _handle_cancel_job(self, data: dict) -> None:
-        """Delete a K8s Job for a canceled run."""
-        from terrapod.runner.job_manager import delete_job
-
+        """Stop the execution for a canceled run."""
         job_name = data.get("job_name", "")
         job_namespace = data.get("job_namespace", "")
 
         if not job_name:
             return
+
+        if self._execution_backend == "ecs":
+            try:
+                await (await self._get_ecs_backend()).stop_task(job_name)
+                logger.info("ECS task stopped (canceled)", task=job_name)
+            except Exception as e:
+                logger.warning("Failed to stop ECS task", task=job_name, error=str(e))
+            return
+
+        from terrapod.runner.job_manager import delete_job
 
         try:
             await delete_job(job_name, namespace=job_namespace)
@@ -1683,60 +1946,14 @@ class RunnerListener:
 
         namespace = self.runner_config.runner_namespace
 
-        string_data: dict[str, str] = {}
-        if terraform_vars:
-            string_data["terraform.tfvars.json"] = json.dumps(
-                [
-                    # Either name, from either side of a version skew (#1435).
-                    {
-                        "key": v["key"],
-                        "value": v["value"],
-                        "structured": bool(v.get("structured", v.get("hcl"))),
-                        "hcl": bool(v.get("structured", v.get("hcl"))),
-                        "sensitive": bool(v.get("sensitive")),
-                    }
-                    for v in terraform_vars
-                ]
-            )
-        if execution_hooks:
-            string_data["execution-hooks.json"] = json.dumps(
-                [
-                    {
-                        "hook_point": h.get("hook_point", ""),
-                        "name": h.get("name", ""),
-                        "script": h.get("script", ""),
-                    }
-                    for h in execution_hooks
-                ]
-            )
-        if git_auth:
-            string_data["git-auth.json"] = json.dumps(
-                [
-                    {
-                        "category": g.get("category", ""),
-                        "key": g.get("key", ""),
-                        "value": g.get("value", ""),
-                    }
-                    for g in git_auth
-                ]
-            )
-        if ansible_auth:
-            string_data["ansible-auth.json"] = json.dumps(
-                [
-                    {
-                        "category": a.get("category", ""),
-                        "key": a.get("key", ""),
-                        "value": a.get("value", ""),
-                    }
-                    for a in ansible_auth
-                ]
-            )
-        for var in env_vars:
-            string_data[var["key"]] = var["value"]
-        # _plan_vault_files already refused a clash with an env key, so this
-        # never overwrites one.
-        for secret_key, content in (vault_file_values or {}).items():
-            string_data[secret_key] = content
+        string_data = self._vars_secret_data(
+            terraform_vars,
+            env_vars,
+            execution_hooks,
+            git_auth,
+            ansible_auth,
+            vault_file_values,
+        )
 
         # Kubernetes caps a Secret at 1 MiB across everything in it, not across
         # the Vault files alone (#1691). Sizing only the files let a run pass

@@ -575,6 +575,74 @@
           "type": "integer",
           "minimum": 1
         },
+        "execution": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "backend": {
+              "type": "string",
+              "enum": ["kubernetes", "ecs"]
+            },
+            "ecs": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cluster": {
+                  "type": "string"
+                },
+                "taskDefinition": {
+                  "type": "string"
+                },
+                "region": {
+                  "type": "string"
+                },
+                "subnets": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "securityGroups": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "launchType": {
+                  "type": "string"
+                },
+                "assignPublicIp": {
+                  "type": "boolean"
+                },
+                "containerName": {
+                  "type": "string"
+                },
+                "logGroup": {
+                  "type": "string"
+                },
+                "logStreamPrefix": {
+                  "type": "string"
+                },
+                "taskRoleArn": {
+                  "type": "string"
+                },
+                "executionRoleArn": {
+                  "type": "string"
+                },
+                "ephemeralStorageGib": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "tags": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
         "joinToken": {
           "type": "string"
         },

@@ -209,7 +209,7 @@
     "loading": "Loadin''...",
     "subtitle": "Sign in t'' manage yer infrastructure",
     "subtitleCli": "Sign in t'' authorize th'' CLI",
-    "emailLabel": "Email",
+    "emailLabel": "Email or username",
     "passwordLabel": "Password",
     "signIn": "Sign in",
     "signingIn": "Signin'' in...",

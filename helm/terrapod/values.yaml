@@ -2441,6 +2441,29 @@ listener:
   sseMaxAge: 600          # Proactive SSE reconnect interval (s).
   sseRetryInterval: 5     # Backoff between SSE reconnect attempts (s).
 
+  # Execution backend for runs. Kubernetes is the default and keeps the
+  # listener launching runner Jobs exactly as before. ECS is an opt-in
+  # execution-only backend: the control plane stays here, while runner phases
+  # execute as ECS Tasks. No credentials belong in this block — the listener
+  # uses its pod's normal AWS identity (IRSA / instance role).
+  execution:
+    backend: kubernetes   # kubernetes | ecs
+    ecs:
+      cluster: ""
+      taskDefinition: ""
+      region: ""
+      subnets: []
+      securityGroups: []
+      launchType: FARGATE
+      assignPublicIp: false
+      containerName: runner
+      logGroup: ""
+      logStreamPrefix: terrapod-runner
+      taskRoleArn: ""
+      executionRoleArn: ""
+      ephemeralStorageGib: 0
+      tags: {}
+
   # Join token for pool registration.
   # Either set joinToken directly or reference an existing K8s Secret (recommended).
   # The token is obtained by creating an agent pool + join token via the API.

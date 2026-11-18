@@ -41,8 +41,12 @@ api:
     maxSurge: 0
     maxUnavailable: 1
   config:
-    # Browser-facing URL via `kubectl port-forward svc/terrapod-web 8080:3000`.
-    external_url: "http://localhost:8080"
+    # Catalog-generated module sources embed this host (scheme/path stripped),
+    # and OpenTofu rejects a registry hostname without a dot. A dotted value is
+    # also what the runner's .terraformrc redirects to the in-cluster API, so
+    # keep this host-based rather than the port-forward URL used to reach the
+    # browser UI (kubectl port-forward svc/terrapod-web 8080:3000).
+    external_url: "https://terrapod.local"
     # No engine on/off switch exists any more (#1986), so there is nothing for an
     # eval stack to state: it offers every engine Terrapod can run, which is what
     # an evaluator should see. This block used to resolve a contradiction in the

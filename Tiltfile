@@ -222,6 +222,7 @@ local_resource(
         'services/terrapod/runner/lock_extender.py',
         'services/terrapod/runner/plan_artifacts.py',
         'services/terrapod/runner/job_entrypoint.py',
+        'services/terrapod/runner/ecs_entrypoint.py',
         'services/terrapod/runner/phases',
         'services/terrapod/runner/saas_known_hosts',
         # The ansible callback plugins (#1928, #2144). They are DATA the

@@ -2467,6 +2467,11 @@ jobs:
           # be selected.
           echo "$out" | grep -q 'ee_repository: "ghcr.io/mattrobinsonsre/terrapod-ee"' || { echo "FAIL: config.yaml ansible.ee_repository not rendered — an operator pointing at their own mirror would be silently ignored"; exit 1; }
           echo "$out" | grep -q "availability_ttl_seconds: 300" || { echo "FAIL: config.yaml ansible.availability_ttl_seconds not rendered"; exit 1; }
+          # Execution backend is Kubernetes by default. An empty ECS block is
+          # inert until an operator opts in; both values must reach runners.yaml.
+          echo "$out" | grep -q 'backend: "kubernetes"' || { echo "FAIL: runners.yaml execution.backend not rendered"; exit 1; }
+          echo "$out" | grep -q "assign_public_ip: false" || { echo "FAIL: runners.yaml ECS assign_public_ip not rendered"; exit 1; }
+          echo "$out" | grep -q "ephemeral_storage_gib: 0" || { echo "FAIL: runners.yaml ECS ephemeral_storage_gib not rendered"; exit 1; }
           # Empty by default, so nothing should render -- an operator-supplied
           # environment is opt-in and must not appear from nowhere.
           echo "$out" | grep -q "execution_environments:" && { echo "FAIL: ansible.execution_environments rendered while empty"; exit 1; }
@@ -2474,6 +2479,31 @@ jobs:
           # secret env is injected (no existingSecret) — config-channel contract.
           echo "$out" | grep -q "TERRAPOD_SLACK__" && { echo "FAIL: Slack secret env injected when disabled"; exit 1; }
           echo "Stock install renders web + Ingress + bootstrap + hooks_enabled OK"
+
+      - name: (helm-smoke) ECS execution config reaches runners.yaml, including false and zero
+        run: |
+          out=$(docker run --rm -v "$PWD:/chart" -w /chart "${HELM_IMAGE:-alpine/helm:3.17.2}" \
+            template terrapod helm/terrapod \
+              --namespace terrapod \
+              --set listener.execution.backend=ecs \
+              --set listener.execution.ecs.cluster=runner-cluster \
+              --set listener.execution.ecs.taskDefinition=terrapod-runner \
+              --set listener.execution.ecs.region=eu-west-1 \
+              --set listener.execution.ecs.subnets[0]=subnet-abc \
+              --set listener.execution.ecs.securityGroups[0]=sg-abc \
+              --set listener.execution.ecs.assignPublicIp=false \
+              --set listener.execution.ecs.ephemeralStorageGib=0 \
+              --set listener.execution.ecs.logGroup=/terrapod/runner)
+          echo "$out" | grep -q 'backend: "ecs"' || { echo "FAIL: runners.yaml execution.backend did not reach the pod"; exit 1; }
+          echo "$out" | grep -q 'cluster: "runner-cluster"' || { echo "FAIL: ECS cluster did not reach the pod"; exit 1; }
+          echo "$out" | grep -q 'task_definition: "terrapod-runner"' || { echo "FAIL: ECS task definition did not reach the pod"; exit 1; }
+          echo "$out" | grep -q 'region: "eu-west-1"' || { echo "FAIL: ECS region did not reach the pod"; exit 1; }
+          echo "$out" | grep -q '"subnet-abc"' || { echo "FAIL: ECS subnet did not reach the pod"; exit 1; }
+          echo "$out" | grep -q '"sg-abc"' || { echo "FAIL: ECS security group did not reach the pod"; exit 1; }
+          echo "$out" | grep -q 'log_group: "/terrapod/runner"' || { echo "FAIL: ECS log group did not reach the pod"; exit 1; }
+          echo "$out" | grep -q "assign_public_ip: false" || { echo "FAIL: explicit false was coerced away"; exit 1; }
+          echo "$out" | grep -q "ephemeral_storage_gib: 0" || { echo "FAIL: explicit zero was coerced away"; exit 1; }
+          echo "ECS execution config reaches runners.yaml OK"
 
       - name: (helm-smoke) Bootstrap seeds several agent pools without exposing a token (#1411)
         run: |

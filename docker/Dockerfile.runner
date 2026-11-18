@@ -143,6 +143,9 @@ COPY services/terrapod/runner/debug_linger.py ./terrapod/runner/debug_linger.py
 COPY services/terrapod/runner/lock_extender.py ./terrapod/runner/lock_extender.py
 COPY services/terrapod/runner/plan_artifacts.py ./terrapod/runner/plan_artifacts.py
 COPY services/terrapod/runner/job_entrypoint.py ./terrapod/runner/job_entrypoint.py
+# ECS wrapper: materialises the Secret files Kubernetes would have mounted,
+# then hands over to the unchanged job_entrypoint above.
+COPY services/terrapod/runner/ecs_entrypoint.py ./terrapod/runner/ecs_entrypoint.py
 COPY services/terrapod/runner/phases/ ./terrapod/runner/phases/
 # The host-event callback plugin (#1928). DATA, not a module of ours: it runs
 # inside the execution environment under the EE's interpreter and imports

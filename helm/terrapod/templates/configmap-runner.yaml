@@ -70,6 +70,25 @@ data:
     sse_read_timeout: {{ .Values.listener.sseReadTimeout | default 30 | int64 }}
     sse_max_age: {{ .Values.listener.sseMaxAge | default 600 | int64 }}
     sse_retry_interval: {{ .Values.listener.sseRetryInterval | default 5 | int64 }}
+    {{- /* Execution backend. ECS is opt-in and inert by default; `dig` keeps
+       explicit false/0 values from being coerced to the default. */}}
+    execution:
+      backend: {{ dig "backend" "kubernetes" (dig "execution" dict .Values.listener) | quote }}
+      ecs:
+        cluster: {{ dig "cluster" "" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        task_definition: {{ dig "taskDefinition" "" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        region: {{ dig "region" "" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        subnets: {{ toJson (dig "subnets" (list) (dig "ecs" dict (dig "execution" dict .Values.listener))) }}
+        security_groups: {{ toJson (dig "securityGroups" (list) (dig "ecs" dict (dig "execution" dict .Values.listener))) }}
+        launch_type: {{ dig "launchType" "FARGATE" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        assign_public_ip: {{ dig "assignPublicIp" false (dig "ecs" dict (dig "execution" dict .Values.listener)) }}
+        container_name: {{ dig "containerName" "runner" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        log_group: {{ dig "logGroup" "" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        log_stream_prefix: {{ dig "logStreamPrefix" "terrapod-runner" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        task_role_arn: {{ dig "taskRoleArn" "" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        execution_role_arn: {{ dig "executionRoleArn" "" (dig "ecs" dict (dig "execution" dict .Values.listener)) | quote }}
+        ephemeral_storage_gib: {{ dig "ephemeralStorageGib" 0 (dig "ecs" dict (dig "execution" dict .Values.listener)) | int64 }}
+        tags: {{ toJson (dig "tags" (dict) (dig "ecs" dict (dig "execution" dict .Values.listener))) }}
     {{- with .Values.runners.imagePullSecrets }}
     image_pull_secrets:
       {{- toYaml . | nindent 6 }}

@@ -3,6 +3,9 @@ name = "terrapod-listener"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
+    # Lazy ECS execution backend. aiobotocore alone brings botocore; boto3 is
+    # deliberately not pulled into the listener image.
+    "aiobotocore>=3.10,<4.0",
     "cryptography>=50.0.0,<51.0.0",
     "httpx>=0.28",
     "kubernetes>=35.0",

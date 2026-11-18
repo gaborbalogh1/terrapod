@@ -120,6 +120,73 @@ class RunnerPhaseScheduling(BaseModel):
     affinity: dict = Field(default_factory=dict)
 
 
+class EcsExecutionConfig(BaseModel):
+    """Where and how the listener launches runs as ECS Tasks.
+
+    Only read when ``execution.backend == "ecs"``. Every value is non-sensitive
+    configuration: IAM role ARNs are identifiers, not credentials, and the
+    listener's own AWS identity comes from its pod's normal credential chain
+    (IRSA or an instance role). Nothing here is rendered into a ConfigMap as a
+    secret.
+    """
+
+    cluster: str = Field(default="", description="ECS cluster for runner Tasks.")
+    task_definition: str = Field(
+        default="", description="ECS task definition family or full ARN for runner Tasks."
+    )
+    region: str = Field(default="", description="AWS region for ECS/CloudWatch Logs calls.")
+    subnets: list[str] = Field(default_factory=list, description="Subnets for awsvpc Tasks.")
+    security_groups: list[str] = Field(default_factory=list, description="Security groups for Tasks.")
+    launch_type: str = Field(default="FARGATE")
+    assign_public_ip: bool = Field(default=False)
+    container_name: str = Field(default="runner", description="Name of the runner container.")
+    log_group: str = Field(default="", description="CloudWatch Logs group for runner output.")
+    log_stream_prefix: str = Field(default="terrapod-runner")
+    task_role_arn: str = Field(default="")
+    execution_role_arn: str = Field(default="")
+    ephemeral_storage_gib: int = Field(default=0, description="Fargate ephemeral storage in GiB.")
+    tags: dict[str, str] = Field(default_factory=dict)
+
+
+class RunnerExecutionConfig(BaseModel):
+    """Run-execution backend selection.
+
+    ``kubernetes`` (the default) keeps the existing ephemeral Job behaviour
+    byte-for-byte. ``ecs`` makes the listener launch the same runner image as an
+    ECS Task and translate ECS task state back into the existing listener→API
+    report contract. The control plane stays on Kubernetes in both modes.
+    """
+
+    backend: Literal["kubernetes", "ecs"] = "kubernetes"
+    ecs: EcsExecutionConfig = Field(default_factory=EcsExecutionConfig)
+
+    @model_validator(mode="after")
+    def _validate_selected_backend(self) -> RunnerExecutionConfig:
+        """Reject a half-configured ECS backend at startup, not at run launch.
+
+        Kubernetes remains the default and an empty `ecs` block is inert there.
+        Once ECS is selected, a missing cluster/task definition/subnet would
+        otherwise leave every run queued until launch_timeout and then fail with
+        a generic message; fail at boot with the actual missing keys instead.
+        """
+        if self.backend == "ecs":
+            missing = [
+                name
+                for name, value in (
+                    ("cluster", self.ecs.cluster),
+                    ("task_definition", self.ecs.task_definition),
+                    ("subnets", self.ecs.subnets),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "execution.backend='ecs' requires execution.ecs."
+                    + ", execution.ecs.".join(missing)
+                )
+        return self
+
+
 class RunnerConfig(BaseSettings):
     """Runner + listener configuration, layered defaults → runners.yaml → env.
 
@@ -141,6 +208,7 @@ class RunnerConfig(BaseSettings):
     )
 
     image: RunnerImageConfig = Field(default_factory=RunnerImageConfig)
+    execution: RunnerExecutionConfig = Field(default_factory=RunnerExecutionConfig)
     server_url: str = Field(
         default="",
         description="Internal API URL the listener + runner Jobs call "

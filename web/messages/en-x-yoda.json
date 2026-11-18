@@ -209,7 +209,7 @@
     "loading": "Loading, it is...",
     "subtitle": "To manage your infrastructure, sign in you must",
     "subtitleCli": "To authorize the CLI, sign in you must",
-    "emailLabel": "Email",
+    "emailLabel": "Email or username",
     "passwordLabel": "Password",
     "signIn": "Sign in",
     "signingIn": "Signing in, we are...",
